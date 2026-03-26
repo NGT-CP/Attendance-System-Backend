@@ -1,7 +1,7 @@
 const express = require('express');
 require('dotenv').config();
 const cors = require('cors');
-const rateLimit = require('express-rate-limit'); // ✅ NEW
+const rateLimit = require('express-rate-limit');
 const { sequelize } = require('./models');
 
 const authRoutes = require('./routes/authRoutes');
@@ -14,11 +14,11 @@ const socketHandler = require('./socketHandler');
 const io = socketHandler(server);
 app.set('socketio', io);
 
-// ✅ Fix #13: Use ENV for CORS
-app.use(cors({ origin: process.env.FRONTEND_URL || "http://localhost:3000" }));
+// ✅ FIX 2: Synchronized CORS Origin for both Express and WebSockets
+const allowedOrigin = process.env.FRONTEND_URL || "http://localhost:3000";
+app.use(cors({ origin: allowedOrigin }));
 app.use(express.json());
 
-// ✅ Fix #7: Add Rate Limiting (Max 100 requests per 15 mins per IP)
 const limiter = rateLimit({
   windowMs: 15 * 60 * 1000,
   max: 100,
@@ -29,7 +29,6 @@ app.use('/api/', limiter);
 app.use('/api/auth', authRoutes);
 app.use('/api/classes', classRoutes);
 
-// ✅ Fix #6: Remove { alter: true } for production safety
 sequelize.sync()
   .then(() => {
     console.log('✅ SQL Database Synced');
