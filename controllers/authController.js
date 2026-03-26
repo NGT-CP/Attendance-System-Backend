@@ -12,6 +12,14 @@ exports.register = async (req, res) => {
         if (!firstName || !email || !password) {
             return res.status(400).json({ success: false, error: "Missing fields" });
         }
+        const passwordRegex = /^(?=.*[A-Z])(?=.*\d)(?=.*[\W_]).{8,}$/;
+
+        if (!passwordRegex.test(password)) {
+            return res.status(400).json({
+                success: false,
+                message: "Password must be at least 8 chars, with 1 uppercase, 1 number, and 1 special char."
+            });
+        }
 
         // SECURE: Hash the password before saving
         const salt = await bcrypt.genSalt(10);
