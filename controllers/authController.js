@@ -1,4 +1,4 @@
-const User = require('../models/User');
+const { User } = require('../models');
 const jwt = require('jsonwebtoken');
 const bcrypt = require('bcryptjs');
 
@@ -57,28 +57,5 @@ exports.login = async (req, res) => {
     } catch (error) {
         console.error("Login Error:", error);
         res.status(500).json({ success: false, error: error.message });
-    }
-};
-
-exports.getMe = async (req, res) => {
-    try {
-        // 1. Extract token from headers
-        const authHeader = req.headers['authorization'];
-        const token = authHeader && authHeader.split(' ')[1];
-        if (!token) return res.status(401).json({ success: false, message: "No token provided" });
-
-        // 2. Verify token
-        const decoded = jwt.verify(token, JWT_SECRET);
-
-        // 3. Fetch user details (Exclude password hash!)
-        const user = await User.findByPk(decoded.id, {
-            attributes: ['id', 'firstName', 'lastName', 'email']
-        });
-
-        if (!user) return res.status(404).json({ success: false, message: "User not found" });
-
-        res.json({ success: true, user });
-    } catch (error) {
-        res.status(403).json({ success: false, message: "Invalid or expired token" });
     }
 };

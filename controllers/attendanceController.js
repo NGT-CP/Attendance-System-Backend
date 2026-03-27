@@ -80,7 +80,7 @@ exports.markAttendance = async (req, res) => {
 
         // --- 🚨 ANTI-PROXY VAULT LOGIC STARTS HERE ---
         const deviceId = req.headers['x-device-fingerprint'] || 'UNKNOWN_DEVICE';
-        const ipAddress = req.headers['x-forwarded-for'] || req.connection.remoteAddress || req.ip;
+        const ipAddress = req.headers['x-forwarded-for'] || req.socket?.remoteAddress || req.ip;
 
         if (deviceId !== 'UNKNOWN_DEVICE') {
             // A. "Pass-the-Phone" Blocker: Has this device been used by SOMEONE ELSE for this specific class session?

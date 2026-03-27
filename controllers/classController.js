@@ -47,7 +47,7 @@ exports.createClass = async (req, res) => {
                 user_id: owner_id,
                 class_id: newClass.id,
                 action: 'CREATE_CLASS',
-                ip_address: req.headers['x-forwarded-for'] || req.connection.remoteAddress || req.ip,
+                ip_address: req.headers['x-forwarded-for'] || req.socket?.remoteAddress || req.ip,
                 device_fingerprint: req.headers['x-device-fingerprint'] || 'UNKNOWN_DEVICE'
             });
         } catch (logErr) { console.error("Log error:", logErr.message); }
@@ -79,7 +79,7 @@ exports.joinClass = async (req, res) => {
                 user_id: userId,
                 class_id: classroom.id,
                 action: 'JOIN_CLASS',
-                ip_address: req.headers['x-forwarded-for'] || req.connection.remoteAddress || req.ip,
+                ip_address: req.headers['x-forwarded-for'] || req.socket?.remoteAddress || req.ip,
                 device_fingerprint: req.headers['x-device-fingerprint'] || 'UNKNOWN_DEVICE'
             });
         } catch (logErr) { console.error("Log error:", logErr.message); }

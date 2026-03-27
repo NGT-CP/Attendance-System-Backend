@@ -27,4 +27,13 @@ router.post('/:id/notices', authenticateToken, noticeController.createNotice);
 router.get('/my-notices', authenticateToken, noticeController.getMyNotices);
 router.post('/notices/:noticeId/chat', authenticateToken, noticeController.addChat);
 
+// --- NOTICE MODERATION (teacher) ---
+router.put('/notices/:noticeId', authenticateToken, noticeController.updateNotice);
+router.delete('/notices/:noticeId', authenticateToken, noticeController.deleteNotice);
+router.put('/notices/:noticeId/chat-enabled', authenticateToken, noticeController.setChatEnabled);
+
+// --- CHAT MODERATION (student within 15 min) ---
+router.put('/notices/chat/:chatId', authenticateToken, noticeController.updateChat);
+router.delete('/notices/chat/:chatId', authenticateToken, noticeController.deleteChat);
+
 module.exports = router;
