@@ -67,4 +67,7 @@ router.put('/profile', authenticateToken, async (req, res) => {
     }
 });
 
+router.put('/profile/password', authenticateToken, authController.changePassword);
+router.delete('/profile', authenticateToken, authController.deleteAccount);
+
 module.exports = router;

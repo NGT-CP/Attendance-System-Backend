@@ -15,7 +15,28 @@ exports.createNotice = async (req, res) => {
         const authorId = req.user.id;
         const { title, content, file_url, allows_chat } = req.body;
 
+        if (!title || !content) {
+            return res.status(400).json({ success: false, message: "title and content are required" });
+        }
+
+
+        // 🛡️ SECURITY: Strict URL parsing to prevent phishing/XSS payloads
+        if (file_url) {
+            try {
+                const parsedUrl = new URL(file_url);
+                if (!['http:', 'https:'].includes(parsedUrl.protocol)) {
+                    return res.status(400).json({ success: false, message: "Invalid link. Must be http or https." });
+                }
+            } catch (err) {
+                return res.status(400).json({ success: false, message: "Invalid URL format." });
+            }
+        }
+
         const classroom = await Classroom.findByPk(classId);
+        if (!classroom) {
+            return res.status(404).json({ success: false, message: "Class not found" });
+        }
+
         if (classroom.owner_id !== authorId) {
             return res.status(403).json({ success: false, message: "Only teachers can post notices." });
         }

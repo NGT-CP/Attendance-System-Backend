@@ -1,15 +1,22 @@
 const { Sequelize } = require('sequelize');
 require('dotenv').config();
 
+if (!process.env.DATABASE_URL) {
+    console.error('CRITICAL: DATABASE_URL environment variable is not set. Please configure it before starting the server.');
+    process.exit(1);
+}
+
+const enableDbLogging = process.env.DB_LOGGING === 'true' || process.env.NODE_ENV !== 'production';
+
 const sequelize = new Sequelize(process.env.DATABASE_URL, {
     dialect: 'mysql',
     dialectOptions: {
         ssl: {
-            require: true,               // Force SSL
-            rejectUnauthorized: false    // This bypasses local certificate issues
+            require: true,
+            rejectUnauthorized: process.env.NODE_ENV === 'production' ? true : false
         }
     },
-    logging: console.log // This will show us EXACTLY what the server is doing
+    logging: enableDbLogging ? (msg) => console.log(`[Sequelize] ${msg}`) : false
 });
 
 module.exports = sequelize;

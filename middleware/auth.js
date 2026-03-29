@@ -1,8 +1,12 @@
 const jwt = require('jsonwebtoken');
-const JWT_SECRET = process.env.JWT_SECRET || 'gama_super_secret_key';
 
 // --- 1. HTTP ROUTE MIDDLEWARE ---
 const authenticateToken = (req, res, next) => {
+    const JWT_SECRET = process.env.JWT_SECRET;
+    if (!JWT_SECRET) {
+        return res.status(500).json({ message: "CRITICAL: JWT_SECRET is not configured" });
+    }
+
     const authHeader = req.headers['authorization'];
     const token = authHeader && authHeader.split(' ')[1];
     if (!token) return res.status(401).json({ message: "Access Denied: No token provided" });
@@ -16,6 +20,11 @@ const authenticateToken = (req, res, next) => {
 
 // --- 2. WEBSOCKET MIDDLEWARE (NEW) ---
 authenticateToken.verifySocket = (socket, next) => {
+    const JWT_SECRET = process.env.JWT_SECRET;
+    if (!JWT_SECRET) {
+        return next(new Error("Authentication error: JWT_SECRET is not configured"));
+    }
+
     const token = socket.handshake.auth.token;
     if (!token) return next(new Error("Authentication error: No token provided"));
 

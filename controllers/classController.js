@@ -1,4 +1,5 @@
 const { Classroom, Enrollment, User, AttendanceSession, AttendanceLog, ActivityLog, Notice, ChatMessage } = require('../models');
+const { generateUniqueCode } = require('../codeGenerator');
 
 exports.getMyClasses = async (req, res) => {
     try {
@@ -24,20 +25,7 @@ exports.createClass = async (req, res) => {
         const owner_id = req.user.id;
         if (!class_name) return res.status(400).json({ message: "Class name is required" });
 
-        const generateCode = () => {
-            const chars = 'ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789';
-            let code = '';
-            for (let i = 0; i < 6; i++) code += chars.charAt(Math.floor(Math.random() * chars.length));
-            return code;
-        };
-
-        let join_code = generateCode();
-        let isUnique = false;
-        while (!isUnique) {
-            const existingClass = await Classroom.findOne({ where: { join_code } });
-            if (!existingClass) isUnique = true;
-            else join_code = generateCode();
-        }
+        const join_code = await generateUniqueCode();
 
         const newClass = await Classroom.create({ class_name, join_code, owner_id });
         await Enrollment.create({ user_id: owner_id, class_id: newClass.id });
@@ -101,13 +89,28 @@ exports.getDashboardData = async (req, res) => {
 
         const isTeacher = classroom.owner_id === userId;
 
+        if (!isTeacher) {
+            const isEnrolled = await Enrollment.findOne({
+                where: { user_id: userId, class_id: classId }
+            });
+            if (!isEnrolled) {
+                return res.status(403).json({ success: false, message: "Access Denied: You are not enrolled in this class." });
+            }
+        }
+
         const notices = await Notice.findAll({
             where: { class_id: classId },
             include: [
                 { model: User, as: 'Author', attributes: ['firstName', 'lastName'] },
-                { model: ChatMessage, include: [{ model: User, as: 'Sender', attributes: ['firstName', 'lastName'] }], order: [['createdAt', 'ASC']] }
+                {
+                    model: ChatMessage,
+                    include: [{ model: User, as: 'Sender', attributes: ['firstName', 'lastName'] }]
+                }
             ],
-            order: [['createdAt', 'DESC']]
+            order: [
+                ['createdAt', 'DESC'],
+                [ChatMessage, 'createdAt', 'ASC']
+            ]
         });
 
         const allSessions = await AttendanceSession.findAll({ where: { class_id: classId } });
@@ -142,15 +145,23 @@ exports.getDashboardData = async (req, res) => {
             if (!student || student.id === classroom.owner_id) return null;
 
             const attendedCount = logCounts[student.id] || 0;
+            const actualPercent = totalSessions === 0 ? 0 : Math.round((attendedCount / totalSessions) * 100);
+
+            // 🛠️ FIX: Only send the percentage to the teacher. Send null to peers.
             return {
                 id: student.id,
                 name: `${student.firstName} ${student.lastName}`,
-                percent: totalSessions === 0 ? 0 : Math.round((attendedCount / totalSessions) * 100)
+                percent: isTeacher ? actualPercent : null
             };
         });
 
         const cleanRoster = rosterData.filter(r => r !== null);
         const teacher = await User.findByPk(classroom.owner_id);
+
+        if (!teacher) {
+            return res.status(500).json({ success: false, message: "Teacher account data is missing" });
+        }
+
         const fullRoster = [{ id: teacher.id, name: `${teacher.firstName} ${teacher.lastName}`, isTeacher: true }, ...cleanRoster];
 
         res.json({ success: true, classroom, notices, attendance: myAttendance, allSessions, roster: fullRoster });
@@ -177,9 +188,34 @@ exports.deleteClass = async (req, res) => {
         if (!classroom) return res.status(404).json({ message: "Not found" });
         if (classroom.owner_id !== req.user.id) return res.status(403).json({ message: "Not allowed" });
 
+        // 🛠️ FIX: Manually cascade delete all child records to prevent SQL crash
+        // 1. Delete Attendance Logs & Sessions
+        const sessions = await AttendanceSession.findAll({ where: { class_id: classroom.id } });
+        const sessionIds = sessions.map(s => s.id);
+        if (sessionIds.length > 0) {
+            await AttendanceLog.destroy({ where: { session_id: sessionIds } });
+        }
+        await AttendanceSession.destroy({ where: { class_id: classroom.id } });
+
+        // 2. Delete Chat Messages & Notices
+        const notices = await Notice.findAll({ where: { class_id: classroom.id } });
+        const noticeIds = notices.map(n => n.id);
+        if (noticeIds.length > 0) {
+            await ChatMessage.destroy({ where: { notice_id: noticeIds } });
+        }
+        await Notice.destroy({ where: { class_id: classroom.id } });
+
+        // 3. Delete Enrollments & Activity Logs
+        await Enrollment.destroy({ where: { class_id: classroom.id } });
+        await ActivityLog.destroy({ where: { class_id: classroom.id } });
+
+        // 4. Finally, delete the classroom
         await classroom.destroy();
         res.json({ success: true });
-    } catch (err) { res.status(500).json({ message: "Server error" }); }
+    } catch (err) {
+        console.error("Delete Class Error:", err);
+        res.status(500).json({ message: "Server error deleting class" });
+    }
 };
 
 exports.regenerateCode = async (req, res) => {
@@ -188,9 +224,7 @@ exports.regenerateCode = async (req, res) => {
         if (!classroom) return res.status(404).json({ message: "Class Not found" });
         if (classroom.owner_id !== req.user.id) return res.status(403).json({ message: "Admin only Access" });
 
-        const chars = 'ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789';
-        let new_code = '';
-        for (let i = 0; i < 6; i++) new_code += chars.charAt(Math.floor(Math.random() * chars.length));
+        const new_code = await generateUniqueCode();
 
         classroom.join_code = new_code;
         await classroom.save();
@@ -251,5 +285,67 @@ exports.getOverviewStats = async (req, res) => {
     } catch (error) {
         console.error("Overview Stats Error:", error);
         res.status(500).json({ success: false, message: "Failed to fetch stats" });
+    }
+};
+
+// --- STUDENT PROFILE VIEWER (TEACHER ONLY) ---
+exports.getStudentProfileForTeacher = async (req, res) => {
+    try {
+        const classId = req.params.id;
+        const studentId = req.params.studentId;
+        const teacherId = req.user.id;
+
+        // The middleware requireTeacher already verified the user owns this class
+        const classroom = req.classroom;
+        if (!classroom) {
+            return res.status(404).json({ success: false, message: "Class not found." });
+        }
+
+        // 2. Verify the student is actually enrolled in this class
+        const isEnrolled = await Enrollment.findOne({ where: { user_id: studentId, class_id: classId } });
+        if (!isEnrolled) {
+            return res.status(404).json({ success: false, message: "Student is not enrolled in this class." });
+        }
+
+        // 2.5. Prevent teacher from viewing their own profile via this endpoint
+        if (studentId === teacherId) {
+            return res.status(400).json({ success: false, message: "You cannot view your own profile via this endpoint." });
+        }
+
+        // 3. Fetch the student's private profile data
+        const student = await User.findByPk(studentId, {
+            attributes: ['id', 'firstName', 'lastName', 'email', 'mobile', 'instituteId', 'dob']
+        });
+
+        // 4. Calculate detailed attendance for this specific student in this specific class
+        const { Op } = require('sequelize');
+        const totalSessions = await AttendanceSession.count({
+            where: {
+                class_id: classId,
+                session_code: { [Op.ne]: 'CANCELLED' }
+            }
+        });
+
+        const attendedSessions = await AttendanceLog.count({
+            where: { student_id: studentId },
+            include: [{
+                model: AttendanceSession,
+                where: {
+                    class_id: classId,
+                    session_code: { [Op.ne]: 'CANCELLED' }
+                },
+                attributes: []
+            }]
+        });
+
+        res.json({
+            success: true,
+            student,
+            attendance: { total: totalSessions, attended: attendedSessions }
+        });
+
+    } catch (error) {
+        console.error("Student Profile Fetch Error:", error);
+        res.status(500).json({ success: false, message: "Server error fetching student profile." });
     }
 };

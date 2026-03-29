@@ -1,17 +1,27 @@
 const express = require('express');
 const router = express.Router();
 const authenticateToken = require('../middleware/auth');
+const requireTeacher = require('../middleware/roleAuth');
 
 // Import Controllers
 const classController = require('../controllers/classController');
 const attendanceController = require('../controllers/attendanceController');
 const noticeController = require('../controllers/noticeController');
 
+const rateLimit = require('express-rate-limit');
+
+// 🛡️ SECURITY: Prevent brute-forcing class join codes
+const joinLimiter = rateLimit({
+    windowMs: 15 * 60 * 1000,
+    max: 50,
+    message: { success: false, message: "Too many join attempts. Please wait 15 minutes." }
+});
 // --- CLASSROOM DOMAIN ---
 router.get('/my-classes', authenticateToken, classController.getMyClasses);
 router.post('/create', authenticateToken, classController.createClass);
-router.post('/join', authenticateToken, classController.joinClass);
+router.post('/join', authenticateToken, joinLimiter, classController.joinClass);
 router.get('/:id/dashboard-data', authenticateToken, classController.getDashboardData);
+router.get('/:id/student/:studentId', authenticateToken, requireTeacher, classController.getStudentProfileForTeacher);
 router.put('/:id/update', authenticateToken, classController.updateClass);
 router.delete('/:id/delete', authenticateToken, classController.deleteClass);
 router.post('/:id/regenerate-code', authenticateToken, classController.regenerateCode);

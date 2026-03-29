@@ -1,4 +1,5 @@
-const { AttendanceSession, AttendanceLog, ActivityLog, Classroom } = require('../models');
+const { Op } = require('sequelize');
+const { AttendanceSession, AttendanceLog, ActivityLog, Classroom, Enrollment } = require('../models');
 
 // --- HELPER OUTSIDE THE EXPORTS ---
 const getDistanceInMeters = (lat1, lon1, lat2, lon2) => {
@@ -15,6 +16,9 @@ exports.startSession = async (req, res) => {
         const { lat, lng, requireGps } = req.body;
         const classId = req.params.id;
         const teacherId = req.user.id;
+
+        const isTeacher = await Classroom.findOne({ where: { id: classId, owner_id: teacherId } });
+        if (!isTeacher) return res.status(403).json({ success: false, message: "Only the teacher can start an attendance session." });
 
         const code = Math.floor(100000 + Math.random() * 900000).toString();
         const expirationTime = new Date(Date.now() + 2 * 60000); // 2 mins
@@ -51,6 +55,12 @@ exports.markAttendance = async (req, res) => {
         const classId = req.params.id;
         const studentId = req.user.id;
 
+        // 🔥 NEW: Ensure the student actually belongs to this class before accepting codes
+        const isEnrolled = await Enrollment.findOne({ where: { user_id: studentId, class_id: classId } });
+        if (!isEnrolled) {
+            return res.status(403).json({ success: false, message: "You cannot mark attendance for a class you haven't joined." });
+        }
+
         // 1. Session & Code Verification
         const session = await AttendanceSession.findOne({
             where: { class_id: classId, session_code: code, is_active: true }
@@ -71,46 +81,65 @@ exports.markAttendance = async (req, res) => {
 
         if (existingLog) return res.status(400).json({ success: false, message: "You have already marked your attendance for this session!" });
 
-        // 3. Geolocation Check (Updated to 150m for Laptop Wi-Fi tolerance)
+        // 3. Geolocation Check 
+        // 3. Geolocation Check 
         if (session.require_gps) {
-            if (!lat || !lng) return res.status(400).json({ success: false, message: "GPS Location is required." });
+            // 🛡️ PATCH: Explicitly check for null/undefined to prevent math errors
+            if (lat == null || lng == null) {
+                return res.status(400).json({ success: false, message: "GPS Location is required for this session." });
+            }
             const distance = getDistanceInMeters(session.teacher_lat, session.teacher_long, lat, lng);
             if (distance > 150) return res.status(403).json({ success: false, message: `Too far! You are ${Math.round(distance)}m away. Must be within 150m.` });
         }
 
-        // --- 🚨 ANTI-PROXY VAULT LOGIC STARTS HERE ---
+        // --- 🚨 UPDATED ANTI-PROXY VAULT ---
         const deviceId = req.headers['x-device-fingerprint'] || 'UNKNOWN_DEVICE';
         const ipAddress = req.headers['x-forwarded-for'] || req.socket?.remoteAddress || req.ip;
 
         if (deviceId !== 'UNKNOWN_DEVICE') {
-            // A. "Pass-the-Phone" Blocker: Has this device been used by SOMEONE ELSE for this specific class session?
-            const deviceUsedByOther = await ActivityLog.findOne({
-                where: { class_id: classId, action: 'MARK_ATTENDANCE', device_fingerprint: deviceId }
+            const Sequelize = require('sequelize');
+            const { Op } = Sequelize;
+
+            // A. Strict "One Device = One Attendance Per Day" Blocker
+            const deviceUsedToday = await ActivityLog.findOne({
+                where: {
+                    class_id: classId,
+                    action: 'MARK_ATTENDANCE',
+                    device_fingerprint: deviceId,
+                    [Op.and]: [
+                        Sequelize.where(Sequelize.fn('DATE', Sequelize.col('createdAt')), Sequelize.fn('CURDATE'))
+                    ]
+                }
             });
 
-            if (deviceUsedByOther && deviceUsedByOther.user_id !== studentId) {
-                console.log(`🚨 PROXY BLOCKED: User ${studentId} used device ${deviceId} belonging to ${deviceUsedByOther.user_id}`);
+            // 🚨 FIXED: Now blocks the device entirely for this class today, even if it's the same student.
+            if (deviceUsedToday) {
                 return res.status(403).json({
                     success: false,
-                    message: "Security Alert: This device has already been used to mark attendance for another student today."
+                    message: "Security Alert: This device has already been used to mark attendance for this class today."
                 });
             }
 
-            // B. "Account Bounce" Blocker: Has THIS student used a DIFFERENT device recently?
-            const lastUserActivity = await ActivityLog.findOne({
-                where: { user_id: studentId, action: 'MARK_ATTENDANCE' },
-                order: [['createdAt', 'DESC']]
+            // B. "Account Bounce" Blocker (Scoped to Today using DB Timezone)
+            const studentUsedOtherDeviceToday = await ActivityLog.findOne({
+                where: {
+                    class_id: classId,
+                    user_id: studentId,
+                    action: 'MARK_ATTENDANCE',
+                    [Op.and]: [
+                        Sequelize.where(Sequelize.fn('DATE', Sequelize.col('createdAt')), Sequelize.fn('CURDATE'))
+                    ]
+                }
             });
 
-            if (lastUserActivity && lastUserActivity.device_fingerprint !== deviceId) {
-                console.log(`🚨 DEVICE SWITCH BLOCKED: User ${studentId} switched from ${lastUserActivity.device_fingerprint} to ${deviceId}`);
+            if (studentUsedOtherDeviceToday && studentUsedOtherDeviceToday.device_fingerprint !== deviceId) {
                 return res.status(403).json({
                     success: false,
-                    message: "Security Alert: Unrecognized device. You cannot switch devices to mark attendance."
+                    message: "Security Alert: You have already attempted to mark attendance with a different device today."
                 });
             }
         }
-        // --- 🚨 ANTI-PROXY VAULT LOGIC ENDS HERE ---
+        // --- 🚨 ANTI-PROXY VAULT ENDS HERE ---
 
         // 4. Record the Attendance
         await AttendanceLog.create({
@@ -122,7 +151,7 @@ exports.markAttendance = async (req, res) => {
             distance_verified: session.require_gps
         });
 
-        // 5. Log the Hardware details for future security checks
+        // 5. Log the Hardware details
         await ActivityLog.create({
             user_id: studentId,
             class_id: classId,
@@ -140,17 +169,54 @@ exports.markAttendance = async (req, res) => {
 
 exports.cancelSession = async (req, res) => {
     try {
-        const classroom = await Classroom.findByPk(req.params.id);
+        const classId = req.params.id;
+        const classroom = await Classroom.findByPk(classId);
         if (classroom.owner_id !== req.user.id) return res.status(403).json({ message: "Only teachers can do this." });
 
-        const session = await AttendanceSession.create({
-            class_id: req.params.id,
-            session_code: 'CANCELLED',
-            is_active: false
+        const Sequelize = require('sequelize');
+        const { Op } = Sequelize;
+
+        // Check if a session already exists TODAY using DB Timezone
+        let session = await AttendanceSession.findOne({
+            where: {
+                class_id: classId,
+                [Op.and]: [
+                    Sequelize.where(Sequelize.fn('DATE', Sequelize.col('createdAt')), Sequelize.fn('CURDATE'))
+                ]
+            }
         });
+
+        if (session) {
+            // Overwrite existing session
+            session.session_code = 'CANCELLED';
+            session.is_active = false;
+            await session.save();
+
+            // Destroy any attendance logs submitted today
+            await AttendanceLog.destroy({ where: { session_id: session.id } });
+
+            // 🔥 FIXED: Clear the Anti-Proxy vault for today using native DB dates
+            await ActivityLog.destroy({
+                where: {
+                    class_id: classId,
+                    action: 'MARK_ATTENDANCE',
+                    [Op.and]: [
+                        Sequelize.where(Sequelize.fn('DATE', Sequelize.col('createdAt')), Sequelize.fn('CURDATE'))
+                    ]
+                }
+            });
+        } else {
+            // Create a new cancelled session
+            session = await AttendanceSession.create({
+                class_id: classId,
+                session_code: 'CANCELLED',
+                is_active: false
+            });
+        }
 
         res.json({ success: true, session });
     } catch (error) {
+        console.error(error);
         res.status(500).json({ success: false, message: "Failed to mark leave" });
     }
 };
