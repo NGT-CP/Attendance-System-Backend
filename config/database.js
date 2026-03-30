@@ -13,7 +13,7 @@ const sequelize = new Sequelize(process.env.DATABASE_URL, {
     dialectOptions: {
         ssl: {
             require: true,
-            rejectUnauthorized: process.env.NODE_ENV === 'production' ? true : false
+            rejectUnauthorized: false
         }
     },
     logging: enableDbLogging ? (msg) => console.log(`[Sequelize] ${msg}`) : false
