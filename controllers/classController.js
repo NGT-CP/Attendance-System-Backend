@@ -94,7 +94,7 @@ exports.getDashboardData = async (req, res) => {
                 where: { user_id: userId, class_id: classId }
             });
             if (!isEnrolled) {
-                return res.status(403).json({ success: false, message: "Access Denied: You are not enrolled in this class." });
+                return res.status(403).json({ success: false, message: "Access Denied." });
             }
         }
 
@@ -107,16 +107,30 @@ exports.getDashboardData = async (req, res) => {
                     include: [{ model: User, as: 'Sender', attributes: ['firstName', 'lastName'] }]
                 }
             ],
-            order: [
-                ['createdAt', 'DESC'],
-                [ChatMessage, 'createdAt', 'ASC']
-            ]
+            order: [['createdAt', 'DESC'], [ChatMessage, 'createdAt', 'ASC']]
         });
 
-        const allSessions = await AttendanceSession.findAll({ where: { class_id: classId } });
-        const validSessions = allSessions.filter(s => s.session_code !== 'CANCELLED');
-        const totalSessions = validSessions.length;
+        // --- STRICT FILTERING LOGIC ---
+        const rawSessions = await AttendanceSession.findAll({
+            where: { class_id: classId },
+            order: [['createdAt', 'DESC']]
+        });
 
+        const uniqueSessionsMap = new Map();
+        rawSessions.forEach(session => {
+            if (session.session_code === 'CANCELLED') return; // Throw away cancelled
+
+            // Group by calendar day so duplicates are merged into 1
+            const dateStr = new Date(session.createdAt).toDateString();
+            if (!uniqueSessionsMap.has(dateStr)) {
+                uniqueSessionsMap.set(dateStr, session);
+            }
+        });
+
+        const finalValidSessions = Array.from(uniqueSessionsMap.values());
+        const totalSessions = finalValidSessions.length;
+
+        // --- ROSTER & PERCENTAGE MATH ---
         let myAttendance = [];
         if (!isTeacher) {
             myAttendance = await AttendanceLog.findAll({
@@ -147,7 +161,6 @@ exports.getDashboardData = async (req, res) => {
             const attendedCount = logCounts[student.id] || 0;
             const actualPercent = totalSessions === 0 ? 0 : Math.round((attendedCount / totalSessions) * 100);
 
-            // 🛠️ FIX: Only send the percentage to the teacher. Send null to peers.
             return {
                 id: student.id,
                 name: `${student.firstName} ${student.lastName}`,
@@ -157,15 +170,24 @@ exports.getDashboardData = async (req, res) => {
 
         const cleanRoster = rosterData.filter(r => r !== null);
         const teacher = await User.findByPk(classroom.owner_id);
-
-        if (!teacher) {
-            return res.status(500).json({ success: false, message: "Teacher account data is missing" });
-        }
-
         const fullRoster = [{ id: teacher.id, name: `${teacher.firstName} ${teacher.lastName}`, isTeacher: true }, ...cleanRoster];
 
-        res.json({ success: true, classroom, notices, attendance: myAttendance, allSessions, roster: fullRoster });
+        // 🚨 DIAGNOSTIC LOG 🚨
+        console.log(`\n--- CLASS ${classId} DIAGNOSTICS ---`);
+        console.log(`Raw Database Rows: ${rawSessions.length}`);
+        console.log(`Filtered Unique Days (totalSessions): ${totalSessions}`);
+        console.log(`-----------------------------------\n`);
+
+        res.json({
+            success: true,
+            classroom,
+            notices,
+            attendance: myAttendance,
+            allSessions: finalValidSessions, // Sending the filtered array
+            roster: fullRoster
+        });
     } catch (error) {
+        console.error(error);
         res.status(500).json({ success: false, message: "Failed to fetch data" });
     }
 };
@@ -249,10 +271,18 @@ exports.getOverviewStats = async (req, res) => {
         const allLogs = await AttendanceLog.findAll({ where: { student_id: userId } });
 
         const classStats = classes.map(cls => {
+            // 🔥 Get sessions for this class, ignoring CANCELLED
             const clsSessions = allSessions.filter(s => s.class_id === cls.id && s.session_code !== 'CANCELLED');
+
+            // 🔥 Keep only unique dates
+            const uniqueDates = new Set(clsSessions.map(s => new Date(s.createdAt).toDateString()));
+            const total = uniqueDates.size;
+
+            // Count attended days
             const clsLogs = allLogs.filter(l => clsSessions.some(s => s.id === l.session_id));
-            const total = clsSessions.length;
-            const attended = clsLogs.length;
+            const attendedDates = new Set(clsLogs.map(l => new Date(l.createdAt).toDateString()));
+            const attended = attendedDates.size;
+
             return { ...cls.toJSON(), attendancePercent: total === 0 ? 0 : Math.round((attended / total) * 100) };
         });
 
@@ -317,16 +347,24 @@ exports.getStudentProfileForTeacher = async (req, res) => {
             attributes: ['id', 'firstName', 'lastName', 'email', 'mobile', 'instituteId', 'dob']
         });
 
-        // 4. Calculate detailed attendance for this specific student in this specific class
+        // 4. Calculate detailed attendance using UNIQUE DAYS to ignore historical duplicates
         const { Op } = require('sequelize');
-        const totalSessions = await AttendanceSession.count({
+
+        // Fetch all valid sessions for the class
+        const validSessions = await AttendanceSession.findAll({
             where: {
                 class_id: classId,
                 session_code: { [Op.ne]: 'CANCELLED' }
-            }
+            },
+            attributes: ['createdAt'] // We only need the date
         });
 
-        const attendedSessions = await AttendanceLog.count({
+        // Use a Set to extract only unique calendar days
+        const uniqueClassDates = new Set(validSessions.map(s => new Date(s.createdAt).toDateString()));
+        const totalSessions = uniqueClassDates.size;
+
+        // Fetch all the student's attendance logs for this class
+        const attendedLogs = await AttendanceLog.findAll({
             where: { student_id: studentId },
             include: [{
                 model: AttendanceSession,
@@ -334,9 +372,15 @@ exports.getStudentProfileForTeacher = async (req, res) => {
                     class_id: classId,
                     session_code: { [Op.ne]: 'CANCELLED' }
                 },
-                attributes: []
+                attributes: ['createdAt']
             }]
         });
+
+        // Use a Set to extract only the unique days the student was present
+        const uniqueAttendedDates = new Set(attendedLogs.map(log =>
+            new Date(log.AttendanceSession.createdAt).toDateString()
+        ));
+        const attendedSessions = uniqueAttendedDates.size;
 
         res.json({
             success: true,

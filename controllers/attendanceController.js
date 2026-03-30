@@ -23,24 +23,61 @@ exports.startSession = async (req, res) => {
         const code = Math.floor(100000 + Math.random() * 900000).toString();
         const expirationTime = new Date(Date.now() + 2 * 60000); // 2 mins
 
-        const session = await AttendanceSession.create({
-            class_id: classId,
-            session_code: code,
-            teacher_lat: lat || null,
-            teacher_long: lng || null,
-            require_gps: requireGps,
-            expires_at: expirationTime,
-            is_active: true
+        const Sequelize = require('sequelize');
+        const { Op } = Sequelize;
+
+        // 🔥 THE FIX: Calculate exact start and end of TODAY in Node.js
+        const startOfDay = new Date();
+        startOfDay.setHours(0, 0, 0, 0);
+        const endOfDay = new Date();
+        endOfDay.setHours(23, 59, 59, 999);
+
+        // Find session between 12:00 AM and 11:59 PM today
+        let session = await AttendanceSession.findOne({
+            where: {
+                class_id: classId,
+                createdAt: {
+                    [Op.between]: [startOfDay, endOfDay]
+                }
+            }
         });
 
-        await AttendanceLog.create({
-            session_id: session.id,
-            student_id: teacherId,
-            status: 'PRESENT',
-            student_lat: lat || null,
-            student_long: lng || null,
-            distance_verified: true
+        if (session) {
+            // Update the existing session! No more duplicates.
+            session.session_code = code;
+            session.teacher_lat = lat || null;
+            session.teacher_long = lng || null;
+            session.require_gps = requireGps;
+            session.expires_at = expirationTime;
+            session.is_active = true;
+            await session.save();
+        } else {
+            // Create a brand new session
+            session = await AttendanceSession.create({
+                class_id: classId,
+                session_code: code,
+                teacher_lat: lat || null,
+                teacher_long: lng || null,
+                require_gps: requireGps,
+                expires_at: expirationTime,
+                is_active: true
+            });
+        }
+
+        const existingTeacherLog = await AttendanceLog.findOne({
+            where: { session_id: session.id, student_id: teacherId }
         });
+
+        if (!existingTeacherLog) {
+            await AttendanceLog.create({
+                session_id: session.id,
+                student_id: teacherId,
+                status: 'PRESENT',
+                student_lat: lat || null,
+                student_long: lng || null,
+                distance_verified: true
+            });
+        }
 
         res.json({ success: true, code: session.session_code, expires_at: session.expires_at });
     } catch (error) {
@@ -176,37 +213,38 @@ exports.cancelSession = async (req, res) => {
         const Sequelize = require('sequelize');
         const { Op } = Sequelize;
 
-        // Check if a session already exists TODAY using DB Timezone
+        // 🔥 THE FIX: Calculate exact start and end of TODAY in Node.js
+        const startOfDay = new Date();
+        startOfDay.setHours(0, 0, 0, 0);
+        const endOfDay = new Date();
+        endOfDay.setHours(23, 59, 59, 999);
+
         let session = await AttendanceSession.findOne({
             where: {
                 class_id: classId,
-                [Op.and]: [
-                    Sequelize.where(Sequelize.fn('DATE', Sequelize.col('createdAt')), Sequelize.fn('CURDATE'))
-                ]
+                createdAt: {
+                    [Op.between]: [startOfDay, endOfDay]
+                }
             }
         });
 
         if (session) {
-            // Overwrite existing session
             session.session_code = 'CANCELLED';
             session.is_active = false;
             await session.save();
 
-            // Destroy any attendance logs submitted today
             await AttendanceLog.destroy({ where: { session_id: session.id } });
 
-            // 🔥 FIXED: Clear the Anti-Proxy vault for today using native DB dates
             await ActivityLog.destroy({
                 where: {
                     class_id: classId,
                     action: 'MARK_ATTENDANCE',
-                    [Op.and]: [
-                        Sequelize.where(Sequelize.fn('DATE', Sequelize.col('createdAt')), Sequelize.fn('CURDATE'))
-                    ]
+                    createdAt: {
+                        [Op.between]: [startOfDay, endOfDay]
+                    }
                 }
             });
         } else {
-            // Create a new cancelled session
             session = await AttendanceSession.create({
                 class_id: classId,
                 session_code: 'CANCELLED',
