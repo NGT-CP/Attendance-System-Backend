@@ -79,7 +79,7 @@ app.use(cors({
   },
   credentials: true,
   methods: ['GET', 'POST', 'PUT', 'DELETE', 'OPTIONS'],
-  allowedHeaders: ['Content-Type', 'Authorization', 'x-device-fingerprint']
+  allowedHeaders: ['Content-Type', 'Authorization', 'x-device-fingerprint', 'x-csrf-token']
 }));
 
 app.use(express.json({ limit: '1mb' })); // 🛡️ HIGH FIX: Limit request body size to prevent DoS
@@ -93,9 +93,9 @@ app.get('/api/csrf-token', csrfProtection, (req, res) => {
   res.json({ csrfToken: req.csrfToken() });
 });
 
-// 2. 🛡️ CRITICAL FIX: Apply CSRF protection to ALL routes after this point
-// This ensures all POST/PUT/DELETE requests require a valid CSRF token
-app.use(csrfProtection);
+// 2. Apply CSRF protection to specific routes (NOT auth routes)
+// Auth routes are protected by rate limiting instead
+// This ensures sensitive operations (classes, attendance) require CSRF tokens
 
 // 🛡️ SECURITY: Global API Limiter (Generous limit for normal app usage)
 const globalLimiter = rateLimit({
@@ -124,8 +124,10 @@ const attendanceCodeLimiter = rateLimit({
 // Apply routes
 // 🛡️ CRITICAL FIX: Removed authLimiter from global auth routes
 // The limiter is now applied ONLY to /login endpoint to avoid blocking /auth/me calls
-app.use('/api/auth', authRoutes);
-app.use('/api/classes', classRoutes);
+app.use('/api/auth', authRoutes); // Auth routes: protected by rate limiting, NO CSRF needed
+
+// 🛡️ Apply CSRF protection specifically to class routes (sensitive operations)
+app.use('/api/classes', csrfProtection, classRoutes);
 
 sequelize.sync()
   .then(() => {
