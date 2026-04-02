@@ -1,4 +1,4 @@
-const { User } = require('../models');
+const { User, sequelize } = require('../models');
 const jwt = require('jsonwebtoken');
 const bcrypt = require('bcryptjs');
 const { Classroom, Notice, ChatMessage, AttendanceSession, AttendanceLog, Enrollment, ActivityLog } = require('../models');
@@ -16,6 +16,12 @@ exports.register = async (req, res) => {
 
         if (!firstName || !email || !password) {
             return res.status(400).json({ success: false, error: "Missing fields" });
+        }
+
+        // 🛡️ HIGH FIX #3: Add email format validation
+        const emailRegex = /^[^\s@]+@[^\s@]+\.[^\s@]+$/;
+        if (!emailRegex.test(email)) {
+            return res.status(400).json({ success: false, message: "Invalid email format" });
         }
 
         // Check if email already exists
@@ -56,31 +62,38 @@ exports.login = async (req, res) => {
         const { email, password } = req.body;
 
         const user = await User.findOne({ where: { email } });
-        if (!user) return res.status(401).json({ success: false, message: "Invalid credentials" });
-
-        let isMatch = false;
-
-        // 🛠️ Graceful Migration for Old Plaintext Passwords
-        if (user.password.startsWith('$2a$') || user.password.startsWith('$2b$') || user.password.startsWith('$2y$')) {
-            // It's a new, hashed account
-            isMatch = await bcrypt.compare(password, user.password);
-        } else {
-            // It's an old, plaintext account
-            if (password === user.password) {
-                isMatch = true;
-
-                // Auto-upgrade their account to use bcrypt hashing seamlessly
-                console.log(`Upgrading plaintext password to bcrypt for user: ${email}`);
-                const salt = await bcrypt.genSalt(10);
-                user.password = await bcrypt.hash(password, salt);
-                await user.save();
-            }
+        if (!user) {
+            // 🛡️ Log failed login attempts for security monitoring
+            console.warn(`[SECURITY] Failed login attempt for email: ${email} from IP: ${req.ip}`);
+            return res.status(401).json({ success: false, message: "Invalid credentials" });
         }
 
-        if (!isMatch) return res.status(401).json({ success: false, message: "Invalid credentials" });
+        // 🛡️ PRODUCTION FIX: Strict bcrypt-only password validation
+        // Do NOT support plaintext passwords - they are a data breach risk
+        let isMatch = false;
+        try {
+            isMatch = await bcrypt.compare(password, user.password);
+        } catch (err) {
+            // bcrypt.compare will reject invalid hash formats
+            console.error(`[SECURITY] Password comparison failed for ${email}:`, err.message);
+            isMatch = false;
+        }
+
+        if (!isMatch) {
+            console.warn(`[SECURITY] Failed login attempt for email: ${email} from IP: ${req.ip}`);
+            return res.status(401).json({ success: false, message: "Invalid credentials" });
+        }
 
         // GENERATE TOKEN
         const token = jwt.sign({ id: user.id }, JWT_SECRET, { expiresIn: '24h' });
+
+        // 🛡️ HIGH FIX #2: Send token in HTTP-only cookie AND response body
+        res.cookie('token', token, {
+            httpOnly: true,
+            secure: process.env.NODE_ENV === 'production', // HTTPS only in production
+            sameSite: 'lax', // Use 'lax' not 'strict' to allow cross-origin requests in development
+            maxAge: 24 * 60 * 60 * 1000 // 24 hours
+        });
 
         res.json({ success: true, message: "Login successful!", token });
     } catch (error) {
@@ -117,36 +130,42 @@ exports.deleteAccount = async (req, res) => {
     try {
         const userId = req.user.id;
 
-        // 1. Find all classes owned by this teacher (if they are a teacher)
-        const ownedClasses = await Classroom.findAll({ where: { owner_id: userId } });
-        const classIds = ownedClasses.map(c => c.id);
+        // 🛡️ CRITICAL FIX: Wrap cascade deletion in transaction to prevent orphaned data
+        await sequelize.transaction(async (t) => {
+            // 1. Find all classes owned by this teacher (if they are a teacher)
+            const ownedClasses = await Classroom.findAll({ where: { owner_id: userId }, transaction: t });
+            const classIds = ownedClasses.map(c => c.id);
 
-        if (classIds.length > 0) {
-            // Nuke all data inside their classes
-            const sessions = await AttendanceSession.findAll({ where: { class_id: classIds } });
-            const sessionIds = sessions.map(s => s.id);
-            if (sessionIds.length > 0) await AttendanceLog.destroy({ where: { session_id: sessionIds } });
+            if (classIds.length > 0) {
+                // Nuke all data inside their classes
+                const sessions = await AttendanceSession.findAll({ where: { class_id: classIds }, transaction: t });
+                const sessionIds = sessions.map(s => s.id);
+                if (sessionIds.length > 0) await AttendanceLog.destroy({ where: { session_id: sessionIds }, transaction: t });
 
-            await AttendanceSession.destroy({ where: { class_id: classIds } });
+                await AttendanceSession.destroy({ where: { class_id: classIds }, transaction: t });
 
-            const notices = await Notice.findAll({ where: { class_id: classIds } });
-            const noticeIds = notices.map(n => n.id);
-            if (noticeIds.length > 0) await ChatMessage.destroy({ where: { notice_id: noticeIds } });
+                const notices = await Notice.findAll({ where: { class_id: classIds }, transaction: t });
+                const noticeIds = notices.map(n => n.id);
+                if (noticeIds.length > 0) await ChatMessage.destroy({ where: { notice_id: noticeIds }, transaction: t });
 
-            await Notice.destroy({ where: { class_id: classIds } });
-            await Enrollment.destroy({ where: { class_id: classIds } });
-            await ActivityLog.destroy({ where: { class_id: classIds } });
-            await Classroom.destroy({ where: { owner_id: userId } });
-        }
+                await Notice.destroy({ where: { class_id: classIds }, transaction: t });
+                await Enrollment.destroy({ where: { class_id: classIds }, transaction: t });
+                await ActivityLog.destroy({ where: { class_id: classIds }, transaction: t });
+                await Classroom.destroy({ where: { owner_id: userId }, transaction: t });
+            }
 
-        // 2. Nuke user's specific data across the whole app (if they are a student)
-        await ChatMessage.destroy({ where: { sender_id: userId } });
-        await AttendanceLog.destroy({ where: { student_id: userId } });
-        await Enrollment.destroy({ where: { user_id: userId } });
-        await ActivityLog.destroy({ where: { user_id: userId } });
+            // 2. Nuke user's specific data across the whole app (if they are a student)
+            await ChatMessage.destroy({ where: { sender_id: userId }, transaction: t });
+            await AttendanceLog.destroy({ where: { student_id: userId }, transaction: t });
+            await Enrollment.destroy({ where: { user_id: userId }, transaction: t });
+            await ActivityLog.destroy({ where: { user_id: userId }, transaction: t });
 
-        // 3. Finally, delete the user
-        await User.destroy({ where: { id: userId } });
+            // 3. Log the account deletion for audit purposes
+            // TODO: Create AuditLog table and log here
+
+            // 4. Finally, delete the user
+            await User.destroy({ where: { id: userId }, transaction: t });
+        });
 
         res.json({ success: true, message: "Account and all associated data permanently deleted." });
     } catch (error) {

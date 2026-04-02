@@ -23,7 +23,7 @@ exports.createClass = async (req, res) => {
     try {
         const { class_name } = req.body;
         const owner_id = req.user.id;
-        if (!class_name) return res.status(400).json({ message: "Class name is required" });
+        if (!class_name) return res.status(400).json({ success: false, message: "Class name is required" });
 
         const join_code = await generateUniqueCode();
 
@@ -52,13 +52,13 @@ exports.joinClass = async (req, res) => {
         const { join_code } = req.body;
         const userId = req.user.id;
 
-        if (!join_code) return res.status(400).json({ message: "Join code is required" });
+        if (!join_code) return res.status(400).json({ success: false, message: "Join code is required" });
 
         const classroom = await Classroom.findOne({ where: { join_code } });
-        if (!classroom) return res.status(404).json({ message: "Invalid class code. Please try again." });
+        if (!classroom) return res.status(404).json({ success: false, message: "Invalid class code. Please try again." });
 
         const existingEnrollment = await Enrollment.findOne({ where: { user_id: userId, class_id: classroom.id } });
-        if (existingEnrollment) return res.status(400).json({ message: "You are already enrolled in this class!" });
+        if (existingEnrollment) return res.status(400).json({ success: false, message: "You are already enrolled in this class!" });
 
         await Enrollment.create({ user_id: userId, class_id: classroom.id });
 
@@ -195,8 +195,8 @@ exports.getDashboardData = async (req, res) => {
 exports.updateClass = async (req, res) => {
     try {
         const classroom = await Classroom.findByPk(req.params.id);
-        if (!classroom) return res.status(404).json({ message: "Class Not found" });
-        if (classroom.owner_id !== req.user.id) return res.status(403).json({ message: "Admin only Access" });
+        if (!classroom) return res.status(404).json({ success: false, message: "Class Not found" });
+        if (classroom.owner_id !== req.user.id) return res.status(403).json({ success: false, message: "Admin only Access" });
 
         classroom.class_name = req.body.class_name;
         await classroom.save();
@@ -207,8 +207,8 @@ exports.updateClass = async (req, res) => {
 exports.deleteClass = async (req, res) => {
     try {
         const classroom = await Classroom.findByPk(req.params.id);
-        if (!classroom) return res.status(404).json({ message: "Not found" });
-        if (classroom.owner_id !== req.user.id) return res.status(403).json({ message: "Not allowed" });
+        if (!classroom) return res.status(404).json({ success: false, message: "Not found" });
+        if (classroom.owner_id !== req.user.id) return res.status(403).json({ success: false, message: "Not allowed" });
 
         // 🛠️ FIX: Manually cascade delete all child records to prevent SQL crash
         // 1. Delete Attendance Logs & Sessions
@@ -243,8 +243,8 @@ exports.deleteClass = async (req, res) => {
 exports.regenerateCode = async (req, res) => {
     try {
         const classroom = await Classroom.findByPk(req.params.id);
-        if (!classroom) return res.status(404).json({ message: "Class Not found" });
-        if (classroom.owner_id !== req.user.id) return res.status(403).json({ message: "Admin only Access" });
+        if (!classroom) return res.status(404).json({ success: false, message: "Class Not found" });
+        if (classroom.owner_id !== req.user.id) return res.status(403).json({ success: false, message: "Admin only Access" });
 
         const new_code = await generateUniqueCode();
 
@@ -268,7 +268,13 @@ exports.getOverviewStats = async (req, res) => {
         if (classIds.length === 0) return res.json({ success: true, classes: [], trend: [] });
 
         const allSessions = await AttendanceSession.findAll({ where: { class_id: classIds } });
-        const allLogs = await AttendanceLog.findAll({ where: { student_id: userId } });
+        const allLogs = await AttendanceLog.findAll({
+            where: { student_id: userId },
+            include: [{
+                model: AttendanceSession,
+                attributes: ['id', 'createdAt']
+            }]
+        });
 
         const classStats = classes.map(cls => {
             // 🔥 Get sessions for this class, ignoring CANCELLED
@@ -278,9 +284,9 @@ exports.getOverviewStats = async (req, res) => {
             const uniqueDates = new Set(clsSessions.map(s => new Date(s.createdAt).toDateString()));
             const total = uniqueDates.size;
 
-            // Count attended days
+            // Count attended days - use the SESSION date, not the log date
             const clsLogs = allLogs.filter(l => clsSessions.some(s => s.id === l.session_id));
-            const attendedDates = new Set(clsLogs.map(l => new Date(l.createdAt).toDateString()));
+            const attendedDates = new Set(clsLogs.map(l => new Date(l.AttendanceSession.createdAt).toDateString()));
             const attended = attendedDates.size;
 
             return { ...cls.toJSON(), attendancePercent: total === 0 ? 0 : Math.round((attended / total) * 100) };
@@ -302,7 +308,8 @@ exports.getOverviewStats = async (req, res) => {
         });
 
         allLogs.forEach(log => {
-            const monthName = monthNames[new Date(log.createdAt).getMonth()];
+            // Use SESSION date, not log creation date
+            const monthName = monthNames[new Date(log.AttendanceSession.createdAt).getMonth()];
             if (monthlyStats[monthName]) monthlyStats[monthName].attended += 1;
         });
 
@@ -346,6 +353,9 @@ exports.getStudentProfileForTeacher = async (req, res) => {
         const student = await User.findByPk(studentId, {
             attributes: ['id', 'firstName', 'lastName', 'email', 'mobile', 'instituteId', 'dob']
         });
+        if (!student) {
+            return res.status(404).json({ success: false, message: "Student not found." });
+        }
 
         // 4. Calculate detailed attendance using UNIQUE DAYS to ignore historical duplicates
         const { Op } = require('sequelize');

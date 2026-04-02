@@ -1,13 +1,33 @@
 const express = require('express');
 const router = express.Router();
+const rateLimit = require('express-rate-limit'); // 🛡️ ADD IMPORT
 const { User } = require('../models');
 const authController = require('../controllers/authController');
 const authenticateToken = require('../middleware/auth');
 
-
+// 🛡️ CRITICAL FIX: Apply rate limiter ONLY to login to prevent brute force
+// NOT applied to /auth/me or other routes to avoid blocking normal navigation
+const authLimiter = rateLimit({
+  windowMs: 15 * 60 * 1000, // 15 minutes
+  max: 5, // 5 login attempts per 15 min
+  keyGenerator: (req) => req.body?.email || 'unknown', // Rate limit per email
+  message: { success: false, message: "Too many login attempts. Please wait 15 minutes." }
+});
 
 router.post('/register', authController.register);
-router.post('/login', authController.login);
+// 🛡️ CRITICAL FIX: Apply rate limiter ONLY to login endpoint
+router.post('/login', authLimiter, authController.login);
+
+// 🛡️ HIGH FIX: Add logout endpoint to clear HTTP-only cookie
+router.post('/logout', (req, res) => {
+    res.clearCookie('token', {
+        httpOnly: true,
+        secure: process.env.NODE_ENV === 'production',
+        sameSite: 'lax'
+    });
+    res.json({ success: true, message: "Logged out successfully!" });
+});
+
 // --- GET CURRENT USER (FIXED TO LOAD ALL PROFILE DATA ON REFRESH) ---
 router.get('/me', authenticateToken, async (req, res) => {
     try {

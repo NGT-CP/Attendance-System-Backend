@@ -16,6 +16,15 @@ const joinLimiter = rateLimit({
     max: 50,
     message: { success: false, message: "Too many join attempts. Please wait 15 minutes." }
 });
+
+// 🛡️ SECURITY: HIGH FIX - Prevent brute-forcing attendance codes
+const attendanceCodeLimiter = rateLimit({
+    windowMs: 60 * 1000, // 1 minute window
+    max: 5, // 5 attempts per minute
+    keyGenerator: (req) => `${req.user?.id || 'anonymous'}-${req.params.id}`, // per student per class
+    message: { success: false, message: "Too many attendance attempts. Try again later." }
+});
+
 // --- CLASSROOM DOMAIN ---
 router.get('/my-classes', authenticateToken, classController.getMyClasses);
 router.post('/create', authenticateToken, classController.createClass);
@@ -29,7 +38,7 @@ router.get('/overview-stats', authenticateToken, classController.getOverviewStat
 
 // --- ATTENDANCE DOMAIN ---
 router.post('/:id/attendance/start', authenticateToken, attendanceController.startSession);
-router.post('/:id/attendance/mark', authenticateToken, attendanceController.markAttendance);
+router.post('/:id/attendance/mark', authenticateToken, attendanceCodeLimiter, attendanceController.markAttendance); // 🛡️ HIGH FIX: Apply rate limiter
 router.post('/:id/attendance/cancel', authenticateToken, attendanceController.cancelSession);
 
 // --- NOTICE & CHAT DOMAIN ---

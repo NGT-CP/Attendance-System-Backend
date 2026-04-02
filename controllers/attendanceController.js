@@ -1,5 +1,12 @@
+const crypto = require('crypto');
+const Sequelize = require('sequelize');
 const { Op } = require('sequelize');
-const { AttendanceSession, AttendanceLog, ActivityLog, Classroom, Enrollment } = require('../models');
+const { AttendanceSession, AttendanceLog, ActivityLog, Classroom, Enrollment, sequelize } = require('../models');
+
+// 🛡️ CRITICAL FIX #1: Secure cryptographic code generation
+const generateSecureCode = () => {
+    return crypto.randomInt(100000, 999999).toString();
+};
 
 // --- HELPER OUTSIDE THE EXPORTS ---
 const getDistanceInMeters = (lat1, lon1, lat2, lon2) => {
@@ -20,64 +27,68 @@ exports.startSession = async (req, res) => {
         const isTeacher = await Classroom.findOne({ where: { id: classId, owner_id: teacherId } });
         if (!isTeacher) return res.status(403).json({ success: false, message: "Only the teacher can start an attendance session." });
 
-        const code = Math.floor(100000 + Math.random() * 900000).toString();
-        const expirationTime = new Date(Date.now() + 2 * 60000); // 2 mins
+        // 🛡️ CRITICAL FIX #2: Wrap in transaction to prevent race conditions
+        const session = await sequelize.transaction(async (t) => {
+            // 🔥 THE FIX: Calculate exact start and end of TODAY in Node.js
+            const startOfDay = new Date();
+            startOfDay.setHours(0, 0, 0, 0);
+            const endOfDay = new Date();
+            endOfDay.setHours(23, 59, 59, 999);
 
-        const Sequelize = require('sequelize');
-        const { Op } = Sequelize;
+            // Find session between 12:00 AM and 11:59 PM today (atomic operation in transaction)
+            let sess = await AttendanceSession.findOne({
+                where: {
+                    class_id: classId,
+                    createdAt: {
+                        [Op.between]: [startOfDay, endOfDay]
+                    }
+                },
+                transaction: t
+            });
 
-        // 🔥 THE FIX: Calculate exact start and end of TODAY in Node.js
-        const startOfDay = new Date();
-        startOfDay.setHours(0, 0, 0, 0);
-        const endOfDay = new Date();
-        endOfDay.setHours(23, 59, 59, 999);
+            const code = generateSecureCode(); // 🛡️ Using secure crypto now
+            const expirationTime = new Date(Date.now() + 2 * 60000); // 2 mins
 
-        // Find session between 12:00 AM and 11:59 PM today
-        let session = await AttendanceSession.findOne({
-            where: {
-                class_id: classId,
-                createdAt: {
-                    [Op.between]: [startOfDay, endOfDay]
-                }
+            if (sess) {
+                // Update the existing session! No more duplicates.
+                sess.session_code = code;
+                sess.teacher_lat = lat || null;
+                sess.teacher_long = lng || null;
+                sess.require_gps = requireGps;
+                sess.expires_at = expirationTime;
+                sess.is_active = true;
+                await sess.save({ transaction: t });
+            } else {
+                // Create a brand new session
+                sess = await AttendanceSession.create({
+                    class_id: classId,
+                    session_code: code,
+                    teacher_lat: lat || null,
+                    teacher_long: lng || null,
+                    require_gps: requireGps,
+                    expires_at: expirationTime,
+                    is_active: true
+                }, { transaction: t });
             }
-        });
 
-        if (session) {
-            // Update the existing session! No more duplicates.
-            session.session_code = code;
-            session.teacher_lat = lat || null;
-            session.teacher_long = lng || null;
-            session.require_gps = requireGps;
-            session.expires_at = expirationTime;
-            session.is_active = true;
-            await session.save();
-        } else {
-            // Create a brand new session
-            session = await AttendanceSession.create({
-                class_id: classId,
-                session_code: code,
-                teacher_lat: lat || null,
-                teacher_long: lng || null,
-                require_gps: requireGps,
-                expires_at: expirationTime,
-                is_active: true
+            const existingTeacherLog = await AttendanceLog.findOne({
+                where: { session_id: sess.id, student_id: teacherId },
+                transaction: t
             });
-        }
 
-        const existingTeacherLog = await AttendanceLog.findOne({
-            where: { session_id: session.id, student_id: teacherId }
+            if (!existingTeacherLog) {
+                await AttendanceLog.create({
+                    session_id: sess.id,
+                    student_id: teacherId,
+                    status: 'PRESENT',
+                    student_lat: lat || null,
+                    student_long: lng || null,
+                    distance_verified: true
+                }, { transaction: t });
+            }
+
+            return sess;
         });
-
-        if (!existingTeacherLog) {
-            await AttendanceLog.create({
-                session_id: session.id,
-                student_id: teacherId,
-                status: 'PRESENT',
-                student_lat: lat || null,
-                student_long: lng || null,
-                distance_verified: true
-            });
-        }
 
         res.json({ success: true, code: session.session_code, expires_at: session.expires_at });
     } catch (error) {
@@ -118,12 +129,15 @@ exports.markAttendance = async (req, res) => {
 
         if (existingLog) return res.status(400).json({ success: false, message: "You have already marked your attendance for this session!" });
 
-        // 3. Geolocation Check 
-        // 3. Geolocation Check 
+        // 3. Geolocation Check
+        // 🛡️ CRITICAL FIX #3: Explicit null check + range validation before distance calculation
         if (session.require_gps) {
-            // 🛡️ PATCH: Explicitly check for null/undefined to prevent math errors
             if (lat == null || lng == null) {
                 return res.status(400).json({ success: false, message: "GPS Location is required for this session." });
+            }
+            // Validate GPS coordinates are in valid ranges and not NaN/Infinity
+            if (!isFinite(lat) || !isFinite(lng) || lat < -90 || lat > 90 || lng < -180 || lng > 180) {
+                return res.status(400).json({ success: false, message: "Invalid GPS coordinates provided." });
             }
             const distance = getDistanceInMeters(session.teacher_lat, session.teacher_long, lat, lng);
             if (distance > 150) return res.status(403).json({ success: false, message: `Too far! You are ${Math.round(distance)}m away. Must be within 150m.` });
@@ -134,8 +148,11 @@ exports.markAttendance = async (req, res) => {
         const ipAddress = req.headers['x-forwarded-for'] || req.socket?.remoteAddress || req.ip;
 
         if (deviceId !== 'UNKNOWN_DEVICE') {
-            const Sequelize = require('sequelize');
-            const { Op } = Sequelize;
+            // Calculate exact start and end of TODAY to avoid timezone issues
+            const startOfDay = new Date();
+            startOfDay.setHours(0, 0, 0, 0);
+            const endOfDay = new Date();
+            endOfDay.setHours(23, 59, 59, 999);
 
             // A. Strict "One Device = One Attendance Per Day" Blocker
             const deviceUsedToday = await ActivityLog.findOne({
@@ -143,9 +160,9 @@ exports.markAttendance = async (req, res) => {
                     class_id: classId,
                     action: 'MARK_ATTENDANCE',
                     device_fingerprint: deviceId,
-                    [Op.and]: [
-                        Sequelize.where(Sequelize.fn('DATE', Sequelize.col('createdAt')), Sequelize.fn('CURDATE'))
-                    ]
+                    createdAt: {
+                        [Op.between]: [startOfDay, endOfDay]
+                    }
                 }
             });
 
@@ -157,15 +174,15 @@ exports.markAttendance = async (req, res) => {
                 });
             }
 
-            // B. "Account Bounce" Blocker (Scoped to Today using DB Timezone)
+            // B. "Account Bounce" Blocker (Scoped to Today)
             const studentUsedOtherDeviceToday = await ActivityLog.findOne({
                 where: {
                     class_id: classId,
                     user_id: studentId,
                     action: 'MARK_ATTENDANCE',
-                    [Op.and]: [
-                        Sequelize.where(Sequelize.fn('DATE', Sequelize.col('createdAt')), Sequelize.fn('CURDATE'))
-                    ]
+                    createdAt: {
+                        [Op.between]: [startOfDay, endOfDay]
+                    }
                 }
             });
 
@@ -209,9 +226,6 @@ exports.cancelSession = async (req, res) => {
         const classId = req.params.id;
         const classroom = await Classroom.findByPk(classId);
         if (classroom.owner_id !== req.user.id) return res.status(403).json({ message: "Only teachers can do this." });
-
-        const Sequelize = require('sequelize');
-        const { Op } = Sequelize;
 
         // 🔥 THE FIX: Calculate exact start and end of TODAY in Node.js
         const startOfDay = new Date();

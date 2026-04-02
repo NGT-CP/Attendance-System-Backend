@@ -3,6 +3,8 @@ require('dotenv').config();
 const cors = require('cors');
 const rateLimit = require('express-rate-limit');
 const helmet = require('helmet');
+const csrf = require('csurf');
+const cookieParser = require('cookie-parser');
 
 // Validate environment variables FIRST, before loading any other modules
 const validateEnv = () => {
@@ -80,7 +82,20 @@ app.use(cors({
   allowedHeaders: ['Content-Type', 'Authorization', 'x-device-fingerprint']
 }));
 
-app.use(express.json());
+app.use(express.json({ limit: '1mb' })); // 🛡️ HIGH FIX: Limit request body size to prevent DoS
+app.use(cookieParser()); // 🛡️ HIGH FIX: Parse HTTP-only cookies
+
+// 🛡️ HIGH FIX: CSRF Protection with tokens
+const csrfProtection = csrf({ cookie: true }); // 🛡️ USE COOKIES to store the CSRF secret
+
+// 1. Endpoint for the frontend to request the token
+app.get('/api/csrf-token', csrfProtection, (req, res) => {
+  res.json({ csrfToken: req.csrfToken() });
+});
+
+// 2. 🛡️ CRITICAL FIX: Apply CSRF protection to ALL routes after this point
+// This ensures all POST/PUT/DELETE requests require a valid CSRF token
+app.use(csrfProtection);
 
 // 🛡️ SECURITY: Global API Limiter (Generous limit for normal app usage)
 const globalLimiter = rateLimit({
@@ -93,12 +108,23 @@ app.use('/api/', globalLimiter);
 // 🛡️ SECURITY: Strict Auth Limiter (Prevents Brute Force Password Guessing)
 const authLimiter = rateLimit({
   windowMs: 15 * 60 * 1000, // 15 minutes
-  max: 50,
+  max: 5, // 5 login attempts per 15 min
+  keyGenerator: (req) => req.body?.email || 'unknown', // Rate limit per email
   message: { success: false, message: "Too many login attempts. Please wait 15 minutes." }
 });
 
+// 🛡️ SECURITY: Attendance Code Brute Force Limiter
+const attendanceCodeLimiter = rateLimit({
+  windowMs: 60 * 1000, // 1 minute window
+  max: 5, // 5 attempts per minute
+  keyGenerator: (req) => `${req.user?.id || 'anonymous'}-${req.params.id}`, // per student per class
+  message: { success: false, message: "Too many attendance attempts. Try again later." }
+});
+
 // Apply routes
-app.use('/api/auth', authLimiter, authRoutes); // Apply strict limiter to auth
+// 🛡️ CRITICAL FIX: Removed authLimiter from global auth routes
+// The limiter is now applied ONLY to /login endpoint to avoid blocking /auth/me calls
+app.use('/api/auth', authRoutes);
 app.use('/api/classes', classRoutes);
 
 sequelize.sync()
