@@ -28,6 +28,12 @@ const socketHandler = require('./socketHandler');
 const io = socketHandler(server);
 app.set('socketio', io);
 
+// 🛡️ CRITICAL PRODUCTION FIX 1: Trust Proxy
+// When deployed to Vercel/Render/Heroku, load balancers sit in front of Node.js
+// Without this, rate limiters will see all requests coming from the proxy IP
+// This tells Express to read the real user IP from x-forwarded-for header
+app.set('trust proxy', 1);
+
 // --- DEBUG LOGGING + REQUEST TRACING ---
 const requestLogger = (req, res, next) => {
   const userId = req.user?.id || 'anonymous';
@@ -86,7 +92,17 @@ app.use(express.json({ limit: '1mb' })); // 🛡️ HIGH FIX: Limit request body
 app.use(cookieParser()); // 🛡️ HIGH FIX: Parse HTTP-only cookies
 
 // 🛡️ HIGH FIX: CSRF Protection with tokens
-const csrfProtection = csrf({ cookie: true }); // 🛡️ USE COOKIES to store the CSRF secret
+// 🛡️ CRITICAL PRODUCTION FIX 2: Cross-Domain Cookie Settings
+// When frontend and backend are on different domains, browsers block 3rd-party cookies
+// sameSite: 'none' explicitly allows cross-domain cookie sharing (required for HTTPS in production)
+// secure: true enforces HTTPS-only in production to prevent man-in-the-middle attacks
+const csrfProtection = csrf({
+  cookie: {
+    httpOnly: true,
+    secure: process.env.NODE_ENV === 'production',  // HTTPS in production
+    sameSite: process.env.NODE_ENV === 'production' ? 'none' : 'lax'  // 'none' for production, 'lax' for local dev
+  }
+});
 
 // 1. Endpoint for the frontend to request the token
 app.get('/api/csrf-token', csrfProtection, (req, res) => {

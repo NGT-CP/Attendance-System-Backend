@@ -19,11 +19,13 @@ router.post('/register', authController.register);
 router.post('/login', authLimiter, authController.login);
 
 // 🛡️ HIGH FIX: Add logout endpoint to clear HTTP-only cookie
+// 🛡️ CRITICAL PRODUCTION FIX 4: Match logout cookie settings to login settings
+// Must use the exact same cookie options to successfully delete the cookie
 router.post('/logout', (req, res) => {
     res.clearCookie('token', {
         httpOnly: true,
-        secure: process.env.NODE_ENV === 'production',
-        sameSite: 'lax'
+        secure: process.env.NODE_ENV === 'production',  // Must match login
+        sameSite: process.env.NODE_ENV === 'production' ? 'none' : 'lax'  // Must match login
     });
     res.json({ success: true, message: "Logged out successfully!" });
 });

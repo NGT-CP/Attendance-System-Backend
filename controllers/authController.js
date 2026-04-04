@@ -135,11 +135,12 @@ exports.login = async (req, res) => {
         // GENERATE TOKEN
         const token = jwt.sign({ id: user.id }, JWT_SECRET, { expiresIn: '24h' });
 
-        // 🛡️ HIGH FIX #2: Send token in HTTP-only cookie AND response body
+        // 🛡️ CRITICAL PRODUCTION FIX 3: Cross-Domain Auth Cookie
+        // Match the CSRF cookie settings for consistency across different domains
         res.cookie('token', token, {
             httpOnly: true,
-            secure: process.env.NODE_ENV === 'production', // HTTPS only in production
-            sameSite: 'lax', // Use 'lax' not 'strict' to allow cross-origin requests in development
+            secure: process.env.NODE_ENV === 'production',  // Force HTTPS in production
+            sameSite: process.env.NODE_ENV === 'production' ? 'none' : 'lax',  // 'none' for cross-domain, 'lax' for localhost
             maxAge: 24 * 60 * 60 * 1000 // 24 hours
         });
 
