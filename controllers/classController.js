@@ -159,7 +159,7 @@ exports.getDashboardData = async (req, res) => {
             if (!student || student.id === classroom.owner_id) return null;
 
             const attendedCount = logCounts[student.id] || 0;
-            const actualPercent = totalSessions === 0 ? 0 : Math.round((attendedCount / totalSessions) * 100);
+            const actualPercent = totalSessions === 0 ? 0 : Math.floor((attendedCount / totalSessions) * 100);
 
             return {
                 id: student.id,
@@ -289,7 +289,7 @@ exports.getOverviewStats = async (req, res) => {
             const attendedDates = new Set(clsLogs.map(l => new Date(l.AttendanceSession.createdAt).toDateString()));
             const attended = attendedDates.size;
 
-            return { ...cls.toJSON(), attendancePercent: total === 0 ? 0 : Math.round((attended / total) * 100) };
+            return { ...cls.toJSON(), attendancePercent: total === 0 ? 0 : Math.floor((attended / total) * 100) };
         });
 
         const monthlyStats = {};
@@ -315,7 +315,7 @@ exports.getOverviewStats = async (req, res) => {
 
         const trend = Object.keys(monthlyStats).map(month => {
             const stat = monthlyStats[month];
-            return { month, attendance: stat.total === 0 ? 0 : Math.round((stat.attended / stat.total) * 100) };
+            return { month, attendance: stat.total === 0 ? 0 : Math.floor((stat.attended / stat.total) * 100) };
         });
 
         res.json({ success: true, classes: classStats, trend });
