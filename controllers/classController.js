@@ -111,6 +111,7 @@ exports.getDashboardData = async (req, res) => {
         });
 
         // --- STRICT FILTERING LOGIC ---
+        const { Op } = require('sequelize');
         const rawSessions = await AttendanceSession.findAll({
             where: { class_id: classId },
             order: [['createdAt', 'DESC']]
@@ -118,17 +119,23 @@ exports.getDashboardData = async (req, res) => {
 
         const uniqueSessionsMap = new Map();
         rawSessions.forEach(session => {
-            if (session.session_code === 'CANCELLED') return; // Throw away cancelled
-
-            // Group by calendar day so duplicates are merged into 1
             const dateStr = new Date(session.createdAt).toDateString();
-            if (!uniqueSessionsMap.has(dateStr)) {
+
+            // We keep the session if:
+            // 1. We haven't seen this date yet OR
+            // 2. This session is 'CANCELLED' (it overrides normal sessions for that day)
+            if (!uniqueSessionsMap.has(dateStr) || session.session_code === 'CANCELLED') {
                 uniqueSessionsMap.set(dateStr, session);
             }
         });
 
         const finalValidSessions = Array.from(uniqueSessionsMap.values());
-        const totalSessions = finalValidSessions.length;
+
+        // 📊 Count unique calendar days (not session records)
+        // Multiple sessions on the same day should count as 1 attendance day
+        const validSessionsForPercent = finalValidSessions.filter(s => s.session_code !== 'CANCELLED');
+        const uniqueClassDates = new Set(validSessionsForPercent.map(s => new Date(s.createdAt).toDateString()));
+        const totalSessions = uniqueClassDates.size;
 
         // --- ROSTER & PERCENTAGE MATH ---
         let myAttendance = [];
@@ -140,13 +147,31 @@ exports.getDashboardData = async (req, res) => {
         }
 
         const allLogs = await AttendanceLog.findAll({
-            include: [{ model: AttendanceSession, where: { class_id: classId }, attributes: [] }],
+            include: [{
+                model: AttendanceSession,
+                where: {
+                    class_id: classId,
+                    session_code: { [Op.ne]: 'CANCELLED' }  // Exclude cancelled sessions
+                },
+                attributes: ['createdAt']
+            }],
             attributes: ['student_id']
         });
 
+        // Count unique days attended per student (not raw logs)
         const logCounts = {};
         allLogs.forEach(log => {
-            logCounts[log.student_id] = (logCounts[log.student_id] || 0) + 1;
+            const dateStr = new Date(log.AttendanceSession.createdAt).toDateString();
+            // Use a Set for each student to track unique days
+            if (!logCounts[log.student_id]) {
+                logCounts[log.student_id] = new Set();
+            }
+            logCounts[log.student_id].add(dateStr);
+        });
+
+        // Convert Sets to counts
+        Object.keys(logCounts).forEach(studentId => {
+            logCounts[studentId] = logCounts[studentId].size;
         });
 
         const enrollments = await Enrollment.findAll({
