@@ -203,13 +203,23 @@ exports.getDashboardData = async (req, res) => {
         console.log(`Filtered Unique Days (totalSessions): ${totalSessions}`);
         console.log(`-----------------------------------\n`);
 
+        // Calculate student's personal attendance percentage (if student is viewing)
+        let studentPercent = null;
+        if (!isTeacher && myAttendance.length > 0) {
+            const uniqueStudentAttendedDates = new Set(
+                myAttendance.map(log => new Date(log.AttendanceSession.createdAt).toDateString())
+            );
+            studentPercent = totalSessions === 0 ? 0 : Math.floor((uniqueStudentAttendedDates.size / totalSessions) * 100);
+        }
+
         res.json({
             success: true,
             classroom,
             notices,
             attendance: myAttendance,
             allSessions: finalValidSessions, // Sending the filtered array
-            roster: fullRoster
+            roster: fullRoster,
+            studentAttendancePercent: studentPercent  // NEW: Student's % for the banner
         });
     } catch (error) {
         console.error(error);
@@ -417,10 +427,14 @@ exports.getStudentProfileForTeacher = async (req, res) => {
         ));
         const attendedSessions = uniqueAttendedDates.size;
 
+        // Extract the specific dates when the student was present
+        const presentDates = Array.from(uniqueAttendedDates).sort();
+
         res.json({
             success: true,
             student,
-            attendance: { total: totalSessions, attended: attendedSessions }
+            attendance: { total: totalSessions, attended: attendedSessions },
+            presentDates: presentDates  // NEW: Array of date strings like "Mon Apr 14 2026"
         });
 
     } catch (error) {
