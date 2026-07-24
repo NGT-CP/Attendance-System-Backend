@@ -1,93 +1,37 @@
 const express = require('express');
 const router = express.Router();
-const rateLimit = require('express-rate-limit'); // 🛡️ ADD IMPORT
-const { User } = require('../models');
+const rateLimit = require('express-rate-limit');
+
+// 1. Import Controller and Middleware
+// ❌ No require('../models') allowed here anymore
 const authController = require('../controllers/authController');
 const authenticateToken = require('../middleware/auth');
 
-// 🛡️ CRITICAL FIX: Apply rate limiter ONLY to login to prevent brute force
-// NOT applied to /auth/me or other routes to avoid blocking normal navigation
+// 2. Security Middleware
+// 🛡️ Apply rate limiter ONLY to login to prevent brute force
 const authLimiter = rateLimit({
-  windowMs: 15 * 60 * 1000, // 15 minutes
-  max: 5, // 5 login attempts per 15 min
-  keyGenerator: (req) => req.body?.email || 'unknown', // Rate limit per email
-  message: { success: false, message: "Too many login attempts. Please wait 15 minutes." }
+    windowMs: 15 * 60 * 1000, // 15 minutes
+    max: 5, // 5 login attempts per 15 min
+    keyGenerator: (req) => req.body?.email || 'unknown',
+    message: { success: false, message: "Too many login attempts. Please wait 15 minutes." }
 });
 
+// ==========================================
+// PUBLIC ROUTES
+// ==========================================
 router.post('/register', authController.register);
-// 🛡️ CRITICAL FIX: Apply rate limiter ONLY to login endpoint
 router.post('/login', authLimiter, authController.login);
 
-// 🛡️ HIGH FIX: Add logout endpoint to clear HTTP-only cookie
-// 🛡️ CRITICAL PRODUCTION FIX 4: Match logout cookie settings to login settings
-// Must use the exact same cookie options to successfully delete the cookie
-router.post('/logout', (req, res) => {
-    res.clearCookie('token', {
-        httpOnly: true,
-        secure: process.env.NODE_ENV === 'production',  // Must match login
-        sameSite: process.env.NODE_ENV === 'production' ? 'none' : 'lax'  // Must match login
-    });
-    res.json({ success: true, message: "Logged out successfully!" });
-});
+// The inline cookie-clearing logic has been delegated to the controller
+router.post('/logout', authController.logout);
 
-// --- GET CURRENT USER (FIXED TO LOAD ALL PROFILE DATA ON REFRESH) ---
-router.get('/me', authenticateToken, async (req, res) => {
-    try {
-        const user = await User.findByPk(req.user.id, {
-            // Explicitly ask the database for the new fields!
-            attributes: ['id', 'firstName', 'lastName', 'email', 'mobile', 'instituteId', 'dob']
-        });
+// ==========================================
+// PROTECTED ROUTES (Requires valid JWT)
+// ==========================================
 
-        if (!user) {
-            return res.status(404).json({ success: false, message: "User not found" });
-        }
-
-        res.json({ success: true, user });
-    } catch (error) {
-        console.error("Fetch Profile Error:", error);
-        res.status(500).json({ success: false, message: "Server error fetching profile" });
-    }
-});
-
-// --- UPDATE USER PROFILE ---
-router.put('/profile', authenticateToken, async (req, res) => {
-    try {
-        const userId = req.user.id;
-        const { firstName, lastName, mobile, dob, instituteId } = req.body;
-
-        // Find the user in the database
-        const user = await User.findByPk(userId);
-        if (!user) {
-            return res.status(404).json({ success: false, message: "User not found" });
-        }
-
-        // Update the fields (only update if the user actually typed something)
-        if (firstName) user.firstName = firstName;
-        if (lastName) user.lastName = lastName;
-        if (mobile !== undefined) user.mobile = mobile;
-        if (instituteId !== undefined) user.instituteId = instituteId;
-        if (dob !== undefined) user.dob = dob;
-
-        // Save changes to the database
-        await user.save();
-
-        // Return the updated user (excluding the password!)
-        const updatedUser = {
-            id: user.id,
-            firstName: user.firstName,
-            lastName: user.lastName,
-            email: user.email,
-            mobile: user.mobile,
-            instituteId: user.instituteId,
-            dob: user.dob
-        };
-
-        res.json({ success: true, message: "Profile updated!", user: updatedUser });
-    } catch (error) {
-        console.error("Profile Update Error:", error);
-        res.status(500).json({ success: false, message: "Server error updating profile" });
-    }
-});
+// 🛡️ All inline Sequelize logic has been stripped and delegated to the controller
+router.get('/me', authenticateToken, authController.getMe);
+router.put('/profile', authenticateToken, authController.updateProfile);
 
 router.put('/profile/password', authenticateToken, authController.changePassword);
 router.delete('/profile', authenticateToken, authController.deleteAccount);

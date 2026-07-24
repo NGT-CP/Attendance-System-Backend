@@ -1,271 +1,180 @@
-const { Notice, ChatMessage, User, Classroom, Enrollment } = require('../models');
+const supabase = require('../config/supabase');
 
-const FIFTEEN_MINUTES_MS = 15 * 60 * 1000;
-
-const isWithinFifteenMinutes = (createdAt) => {
-    if (!createdAt) return false;
-    const createdTime = new Date(createdAt).getTime();
-    if (Number.isNaN(createdTime)) return false;
-    return (Date.now() - createdTime) <= FIFTEEN_MINUTES_MS;
+const mapUserToCamelCase = (user) => {
+    if (!user) return null;
+    return { firstName: user.first_name, lastName: user.last_name, ...user };
 };
 
+// ==========================================
+// GET ALL MY NOTICES (Dashboard Tab)
+// ==========================================
+exports.getMyNotices = async (req, res) => {
+    try {
+        const userId = req.user.id;
+
+        // Get classes user owns or is enrolled in
+        const { data: enrolledClasses } = await supabase.from('enrollments').select('class_id').eq('user_id', userId);
+        const { data: ownedClasses } = await supabase.from('classrooms').select('id').eq('owner_id', userId);
+
+        const classIds = [
+            ...(enrolledClasses || []).map(e => e.class_id),
+            ...(ownedClasses || []).map(c => c.id)
+        ];
+
+        if (classIds.length === 0) return res.json({ success: true, notices: [] });
+
+        const { data: notices, error } = await supabase
+            .from('notices')
+            .select(`*, Author:users!fk_notices_author(first_name, last_name)`)
+            .in('class_id', classIds)
+            .order('created_at', { ascending: false });
+
+        if (error) throw error;
+
+        const formattedNotices = notices.map(n => ({ ...n, Author: mapUserToCamelCase(n.Author) }));
+        res.json({ success: true, notices: formattedNotices });
+    } catch (error) {
+        console.error("Get Notices Error:", error.message);
+        res.status(500).json({ success: false, message: "Failed to fetch notices" });
+    }
+};
+
+// ==========================================
+// CREATE NOTICE
+// ==========================================
 exports.createNotice = async (req, res) => {
     try {
         const classId = req.params.id;
-        const authorId = req.user.id;
         const { title, content, file_url, allows_chat } = req.body;
+        const authorId = req.user.id;
 
-        if (!title || !content) {
-            return res.status(400).json({ success: false, message: "title and content are required" });
-        }
+        const { data: classroom } = await supabase.from('classrooms').select('owner_id').eq('id', classId).maybeSingle();
+        if (!classroom || classroom.owner_id !== authorId) return res.status(403).json({ success: false, message: "Unauthorized" });
 
+        const { data: notice, error } = await supabase
+            .from('notices')
+            .insert([{ class_id: classId, author_id: authorId, title, content, attachment_url: file_url, allow_chat: allows_chat }])
+            .select(`*, Author:users!fk_notices_author(first_name, last_name)`)
+            .single();
 
-        // 🛡️ SECURITY: Strict URL parsing to prevent phishing/XSS payloads
-        if (file_url) {
-            try {
-                const parsedUrl = new URL(file_url);
-                if (!['http:', 'https:'].includes(parsedUrl.protocol)) {
-                    return res.status(400).json({ success: false, message: "Invalid link. Must be http or https." });
-                }
-            } catch (err) {
-                return res.status(400).json({ success: false, message: "Invalid URL format." });
-            }
-        }
+        if (error) throw error;
 
-        const classroom = await Classroom.findByPk(classId);
-        if (!classroom) {
-            return res.status(404).json({ success: false, message: "Class not found" });
-        }
-
-        if (classroom.owner_id !== authorId) {
-            return res.status(403).json({ success: false, message: "Only teachers can post notices." });
-        }
-
-        let file_name = null;
-
-        const newNotice = await Notice.create({
-            class_id: classId,
-            author_id: authorId,
-            title,
-            content,
-            attachment_url: file_url || null,
-            file_name: file_name,
-            allows_chat: allows_chat
-        });
-
-        const noticeWithDetails = await Notice.findByPk(newNotice.id, {
-            include: [
-                { model: User, as: 'Author', attributes: ['firstName', 'lastName'] },
-                { model: ChatMessage }
-            ]
-        });
-
-        res.status(201).json({ success: true, notice: noticeWithDetails });
+        notice.Author = mapUserToCamelCase(notice.Author);
+        res.status(201).json({ success: true, notice });
     } catch (error) {
-        console.error("Create Notice Error:", error);
+        console.error("Create Notice Error:", error.message);
         res.status(500).json({ success: false, message: "Failed to create notice" });
     }
 };
 
+// ==========================================
+// INLINE CHAT OPERATIONS
+// ==========================================
 exports.addChat = async (req, res) => {
     try {
+        const { noticeId } = req.params;
         const { message } = req.body;
-        const noticeId = req.params.noticeId;
         const senderId = req.user.id;
 
-        if (!message) return res.status(400).json({ message: "Message cannot be empty" });
+        const { data: notice } = await supabase.from('notices').select('allow_chat, class_id').eq('id', noticeId).maybeSingle();
+        if (!notice) return res.status(404).json({ success: false, message: "Notice not found" });
+        if (!notice.allow_chat) return res.status(403).json({ success: false, message: "Replies disabled by teacher." });
 
-        const notice = await Notice.findByPk(noticeId);
-        if (!notice || !notice.allows_chat) {
-            return res.status(403).json({ success: false, message: "The teacher has disabled comments for this notice." });
-        }
+        const { data: chat, error } = await supabase
+            .from('chat_messages')
+            .insert([{ notice_id: noticeId, sender_id: senderId, message }])
+            .select(`*, Sender:users!fk_chat_sender(first_name, last_name)`)
+            .single();
 
-        const newChat = await ChatMessage.create({ message, notice_id: noticeId, sender_id: senderId });
-        const chatWithUser = await ChatMessage.findByPk(newChat.id, {
-            include: [{ model: User, as: 'Sender', attributes: ['firstName', 'lastName'] }]
-        });
+        if (error) throw error;
 
-        res.status(201).json({ success: true, chat: chatWithUser });
+        chat.Sender = mapUserToCamelCase(chat.Sender);
+        res.status(201).json({ success: true, chat });
     } catch (error) {
-        console.error("Chat Error:", error);
+        console.error("Add Chat Error:", error.message);
         res.status(500).json({ success: false, message: "Failed to send message" });
     }
 };
 
-exports.setChatEnabled = async (req, res) => {
+exports.updateChat = async (req, res) => {
     try {
-        const noticeId = req.params.noticeId;
-        const { allows_chat, allowsChat } = req.body;
-        const newAllowsChat = typeof allows_chat !== 'undefined' ? allows_chat : allowsChat;
+        const { chatId } = req.params;
+        const { message } = req.body;
+        const senderId = req.user.id;
 
-        if (typeof newAllowsChat !== 'boolean') {
-            return res.status(400).json({ success: false, message: "allows_chat must be a boolean" });
-        }
+        const { data: chat } = await supabase.from('chat_messages').select('*').eq('id', chatId).maybeSingle();
+        if (!chat) return res.status(404).json({ success: false, message: "Message not found" });
+        if (chat.sender_id !== senderId) return res.status(403).json({ success: false, message: "Unauthorized" });
 
-        const notice = await Notice.findByPk(noticeId);
-        if (!notice) return res.status(404).json({ success: false, message: "Notice not found" });
+        // 15-minute edit limit
+        const diffMinutes = (new Date() - new Date(chat.created_at)) / 1000 / 60;
+        if (diffMinutes > 15) return res.status(403).json({ success: false, message: "Edit time expired (15 mins max)." });
 
-        const classroom = await Classroom.findByPk(notice.class_id);
-        if (!classroom) return res.status(404).json({ success: false, message: "Class not found" });
-        if (classroom.owner_id !== req.user.id) {
-            return res.status(403).json({ success: false, message: "Admin only Access" });
-        }
+        const { error } = await supabase.from('chat_messages').update({ message }).eq('id', chatId);
+        if (error) throw error;
 
-        notice.allows_chat = newAllowsChat;
-        await notice.save();
-
-        res.json({ success: true, notice });
+        res.json({ success: true, message: "Message updated" });
     } catch (error) {
-        console.error("Set Chat Enabled Error:", error);
-        res.status(500).json({ success: false, message: "Failed to update notice chat settings" });
+        console.error("Update Chat Error:", error.message);
+        res.status(500).json({ success: false, message: "Failed to update message" });
     }
 };
 
+exports.deleteChat = async (req, res) => {
+    try {
+        const { error } = await supabase.from('chat_messages').delete().eq('id', req.params.chatId).eq('sender_id', req.user.id);
+        if (error) throw error;
+        res.json({ success: true, message: "Message deleted" });
+    } catch (error) {
+        console.error("Delete Chat Error:", error.message);
+        res.status(500).json({ success: false, message: "Failed to delete message" });
+    }
+};
+
+// ==========================================
+// TEACHER MODERATION CONTROLS
+// ==========================================
 exports.updateNotice = async (req, res) => {
     try {
-        const noticeId = req.params.noticeId;
-        const { title, content, file_url, allows_chat, allowsChat } = req.body;
+        const { noticeId } = req.params;
+        const { title, content, file_url, allows_chat } = req.body;
 
-        const notice = await Notice.findByPk(noticeId);
-        if (!notice) return res.status(404).json({ success: false, message: "Notice not found" });
+        const { error } = await supabase
+            .from('notices')
+            .update({ title, content, attachment_url: file_url, allow_chat: allows_chat })
+            .eq('id', noticeId)
+            .eq('author_id', req.user.id); // Validates ownership implicitly
 
-        const classroom = await Classroom.findByPk(notice.class_id);
-        if (!classroom) return res.status(404).json({ success: false, message: "Class not found" });
-        if (classroom.owner_id !== req.user.id) {
-            return res.status(403).json({ success: false, message: "Admin only Access" });
-        }
-
-        // Only update fields if they're provided.
-        if (typeof title !== 'undefined') notice.title = title;
-        if (typeof content !== 'undefined') notice.content = content;
-        if (typeof file_url !== 'undefined') notice.attachment_url = file_url || null;
-
-        const newAllowsChat = typeof allows_chat !== 'undefined' ? allows_chat : allowsChat;
-        if (typeof newAllowsChat !== 'undefined') notice.allows_chat = newAllowsChat;
-
-        await notice.save();
-        res.json({ success: true, notice });
+        if (error) throw error;
+        res.json({ success: true, message: "Notice updated" });
     } catch (error) {
-        console.error("Update Notice Error:", error);
+        console.error("Update Notice Error:", error.message);
         res.status(500).json({ success: false, message: "Failed to update notice" });
     }
 };
 
 exports.deleteNotice = async (req, res) => {
     try {
-        const noticeId = req.params.noticeId;
-
-        const notice = await Notice.findByPk(noticeId);
-        if (!notice) return res.status(404).json({ success: false, message: "Notice not found" });
-
-        const classroom = await Classroom.findByPk(notice.class_id);
-        if (!classroom) return res.status(404).json({ success: false, message: "Class not found" });
-        if (classroom.owner_id !== req.user.id) {
-            return res.status(403).json({ success: false, message: "Admin only Access" });
-        }
-
-        // Delete related chat messages first to avoid orphaned rows.
-        await ChatMessage.destroy({ where: { notice_id: noticeId } });
-        await notice.destroy();
-
-        res.json({ success: true });
+        // Cascade delete will automatically remove all associated chat_messages
+        const { error } = await supabase.from('notices').delete().eq('id', req.params.noticeId).eq('author_id', req.user.id);
+        if (error) throw error;
+        res.json({ success: true, message: "Notice deleted" });
     } catch (error) {
-        console.error("Delete Notice Error:", error);
+        console.error("Delete Notice Error:", error.message);
         res.status(500).json({ success: false, message: "Failed to delete notice" });
     }
 };
 
-exports.updateChat = async (req, res) => {
+exports.setChatEnabled = async (req, res) => {
     try {
-        const chatId = req.params.chatId;
-        const { message } = req.body;
+        const { noticeId } = req.params;
+        const { allows_chat } = req.body;
 
-        if (!message || !message.trim()) {
-            return res.status(400).json({ success: false, message: "Message cannot be empty" });
-        }
-
-        const chat = await ChatMessage.findByPk(chatId, {
-            include: [{ model: Notice }]
-        });
-        if (!chat) return res.status(404).json({ success: false, message: "Chat not found" });
-
-        if (chat.sender_id !== req.user.id) {
-            return res.status(403).json({ success: false, message: "Not allowed" });
-        }
-
-        if (!isWithinFifteenMinutes(chat.createdAt)) {
-            return res.status(403).json({ success: false, message: "Chat edit window (15 minutes) has expired." });
-        }
-
-        chat.message = message;
-        await chat.save();
-
-        const updatedChatWithUser = await ChatMessage.findByPk(chatId, {
-            include: [{ model: User, as: 'Sender', attributes: ['firstName', 'lastName'] }]
-        });
-
-        res.json({ success: true, chat: updatedChatWithUser });
+        const { error } = await supabase.from('notices').update({ allow_chat: allows_chat }).eq('id', noticeId).eq('author_id', req.user.id);
+        if (error) throw error;
+        res.json({ success: true, message: `Chat ${allows_chat ? 'enabled' : 'disabled'}` });
     } catch (error) {
-        console.error("Update Chat Error:", error);
-        res.status(500).json({ success: false, message: "Failed to update chat" });
-    }
-};
-
-exports.deleteChat = async (req, res) => {
-    try {
-        const chatId = req.params.chatId;
-
-        const chat = await ChatMessage.findByPk(chatId, {
-            include: [{ model: Notice }]
-        });
-        if (!chat) return res.status(404).json({ success: false, message: "Chat not found" });
-
-        const classroom = chat.Notice ? await Classroom.findByPk(chat.Notice.class_id) : null;
-        const isSender = chat.sender_id === req.user.id;
-        const isTeacher = classroom && classroom.owner_id === req.user.id;
-
-        if (!isSender && !isTeacher) {
-            return res.status(403).json({ success: false, message: "Not allowed" });
-        }
-
-        // 15-minute deletion restriction has been removed here. 
-        // Send/Teacher can now delete at any time.
-
-        await chat.destroy();
-        res.json({ success: true });
-    } catch (error) {
-        console.error("Delete Chat Error:", error);
-        res.status(500).json({ success: false, message: "Failed to delete chat" });
-    }
-};
-
-exports.getMyNotices = async (req, res) => {
-    try {
-        const userId = req.user.id;
-
-        const enrollments = await Enrollment.findAll({ where: { user_id: userId } });
-        const classIds = enrollments.map(e => e.class_id);
-
-        if (classIds.length === 0) return res.json({ success: true, notices: [] });
-
-        const notices = await Notice.findAll({
-            where: { class_id: classIds },
-            include: [
-                { model: User, as: 'Author', attributes: ['firstName', 'lastName'] },
-                { model: ChatMessage }
-            ],
-            order: [['createdAt', 'DESC']]
-        });
-
-        const filteredNotices = notices.filter(notice => {
-            if (notice.author_id !== userId) return true;
-            const hasStudentReply = notice.ChatMessages && notice.ChatMessages.some(msg => msg.sender_id !== userId);
-            return hasStudentReply;
-        });
-
-        res.json({ success: true, notices: filteredNotices });
-    } catch (error) {
-        console.error("Dashboard Notices Error:", error);
-        res.status(500).json({ success: false, message: "Failed to fetch dashboard notices" });
+        console.error("Toggle Chat Error:", error.message);
+        res.status(500).json({ success: false, message: "Failed to update chat settings" });
     }
 };
